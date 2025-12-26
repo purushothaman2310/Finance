@@ -1,0 +1,430 @@
+# purushoth_finance.py
+# Purushoth Finance App - Complete Enhanced Version
+# Features: Date filters, Edit transactions, Edit categories, Form persistence
+
+import os
+import sqlite3
+import contextlib
+from datetime import datetime, date
+from typing import List, Optional, Dict
+import webbrowser
+import threading
+import json
+
+from flask import Flask, render_template_string, request, jsonify, redirect, url_for
+import pandas as pd
+import openpyxl
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import io
+import base64
+
+app = Flask(__name__)
+app.secret_key = 'purushoth_finance_secret_key_2024'
+
+CONFIG_FILE = "finance_config.json"
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {"db_path": None}
+
+def save_config(db_path):
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump({"db_path": db_path}, f)
+
+def get_conn(db_path: str):
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+SCHEMA_BASE = """
+CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    t_date TEXT NOT NULL,
+    description TEXT NOT NULL,
+    amount REAL NOT NULL,
+    t_type TEXT NOT NULL,
+    category TEXT NOT NULL,
+    source TEXT NOT NULL,
+    account TEXT NOT NULL DEFAULT 'Main',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE
+);
+"""
+
+@contextlib.contextmanager
+def db_cursor(conn):
+    cur = conn.cursor()
+    try:
+        yield cur
+        conn.commit()
+    finally:
+        cur.close()
+
+def table_has_column(conn, table: str, col: str) -> bool:
+    with db_cursor(conn) as cur:
+        cur.execute(f"PRAGMA table_info({table})")
+        cols = [r[1] for r in cur.fetchall()]
+    return col in cols
+
+def init_db(conn):
+    with db_cursor(conn) as cur:
+        cur.executescript(SCHEMA_BASE)
+    if not table_has_column(conn, 'transactions', 'account'):
+        with db_cursor(conn) as cur:
+            cur.execute("ALTER TABLE transactions ADD COLUMN account TEXT NOT NULL DEFAULT 'Main'")
+    if not pd.read_sql_query("SELECT name FROM accounts", conn).shape[0]:
+        with db_cursor(conn) as cur:
+            cur.execute("INSERT OR IGNORE INTO accounts(name) VALUES ('Main')")
+
+def list_categories(conn) -> List[str]:
+    df = pd.read_sql_query("SELECT name FROM categories ORDER BY name", conn)
+    return df['name'].tolist()
+
+def add_category(conn, name: str):
+    with db_cursor(conn) as cur:
+        cur.execute("INSERT OR IGNORE INTO categories(name) VALUES (?)", (name.strip(),))
+
+def update_category(conn, old_name: str, new_name: str):
+    with db_cursor(conn) as cur:
+        cur.execute("UPDATE categories SET name=? WHERE name=?", (new_name.strip(), old_name))
+        cur.execute("UPDATE transactions SET category=? WHERE category=?", (new_name.strip(), old_name))
+
+def delete_categories(conn, names: List[str]):
+    with db_cursor(conn) as cur:
+        for n in names:
+            cur.execute("DELETE FROM categories WHERE name=?", (n,))
+
+def list_accounts(conn) -> List[str]:
+    df = pd.read_sql_query("SELECT name FROM accounts ORDER BY name", conn)
+    return df['name'].tolist()
+
+def add_account(conn, name: str):
+    with db_cursor(conn) as cur:
+        cur.execute("INSERT OR IGNORE INTO accounts(name) VALUES (?)", (name.strip(),))
+
+def get_transaction_by_id(conn, trans_id: int):
+    df = pd.read_sql_query("SELECT * FROM transactions WHERE id=?", conn, params=[trans_id])
+    if not df.empty:
+        return df.iloc[0].to_dict()
+    return None
+
+def update_transaction(conn, trans_id: int, t_date: str, description: str, amount: float, t_type: str, category: str, source: str, account: str):
+    with db_cursor(conn) as cur:
+        cur.execute(
+            """UPDATE transactions SET t_date=?, description=?, amount=?, t_type=?, category=?, source=?, account=? WHERE id=?""",
+            (t_date, description.strip(), float(amount), t_type, category.strip(), source.strip(), account.strip(), trans_id)
+        )
+
+def delete_transactions(conn, ids: List[int]):
+    if not ids:
+        return
+    with db_cursor(conn) as cur:
+        cur.executemany("DELETE FROM transactions WHERE id=?", [(int(i),) for i in ids])
+
+def insert_transaction(conn, t_date: str, description: str, amount: float, t_type: str, category: str, source: str, account: str):
+    with db_cursor(conn) as cur:
+        cur.execute(
+            """INSERT INTO transactions (t_date, description, amount, t_type, category, source, account, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (t_date, description.strip(), amount, t_type, category.strip(), source.strip(), account.strip(), datetime.utcnow().isoformat())
+        )
+
+def fetch_transactions_df(conn, start_date: Optional[str] = None, end_date: Optional[str] = None, source: Optional[str] = None, account: Optional[str] = None, category: Optional[str] = None, search: Optional[str] = None):
+    q = "SELECT * FROM transactions WHERE 1=1"
+    params = []
+    if start_date:
+        q += " AND t_date >= ?"; params.append(start_date)
+    if end_date:
+        q += " AND t_date <= ?"; params.append(end_date)
+    if source and source != "All":
+        q += " AND source = ?"; params.append(source)
+    if account and account != "All":
+        q += " AND account = ?"; params.append(account)
+    if category and category != "All":
+        q += " AND category = ?"; params.append(category)
+    if search:
+        q += " AND (description LIKE ? OR category LIKE ? OR source LIKE ?)"; params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+    q += " ORDER BY date(t_date) DESC, id DESC"
+    df = pd.read_sql_query(q, conn, params=params)
+    return df
+
+def account_balances(conn, start_date: Optional[str] = None, end_date: Optional[str] = None):
+    accounts = list_accounts(conn)
+    rows = []
+    for acct in accounts:
+        q = "SELECT t_type, SUM(amount) as total FROM transactions WHERE account=?"
+        params = [acct]
+        if start_date:
+            q += " AND t_date >= ?"; params.append(start_date)
+        if end_date:
+            q += " AND t_date <= ?"; params.append(end_date)
+        q += " GROUP BY t_type"
+        df = pd.read_sql_query(q, conn, params=params)
+        inc = float(df[df["t_type"] == "income"]["total"].sum()) if not df.empty else 0.0
+        exp = float(df[df["t_type"] == "expense"]["total"].sum()) if not df.empty else 0.0
+        rows.append({"account": acct, "income": inc, "expense": exp, "balance": inc - exp})
+    return pd.DataFrame(rows)
+
+SETUP_TEMPLATE = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Setup</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.setup-container{background:white;padding:50px;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);max-width:600px;width:100%}h1{color:#2c3e50;margin-bottom:10px;font-size:32px;text-align:center}.subtitle{color:#7f8c8d;margin-bottom:40px;text-align:center}.form-group{margin-bottom:25px}label{display:block;margin-bottom:8px;color:#2c3e50;font-weight:600}input{width:100%;padding:15px;border:2px solid #ecf0f1;border-radius:10px;font-size:16px}input:focus{outline:none;border-color:#667eea}button{width:100%;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;padding:18px;border:none;border-radius:10px;cursor:pointer;font-size:18px;font-weight:600}button:hover{transform:translateY(-2px);box-shadow:0 10px 30px rgba(102,126,234,0.4)}.icon{font-size:48px;text-align:center;margin-bottom:20px}</style>
+</head><body><div class="setup-container"><div class="icon">💰</div><h1>Purushoth Finance</h1><p class="subtitle">Setup your database</p>
+<form action="/setup" method="POST"><div class="form-group"><label>Database Path</label><input type="text" name="db_path" placeholder="my_finance.db" required></div>
+<button type="submit">🚀 Start</button></form></div></body></html>"""
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Purushoth Finance</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#f5f5f5;padding:20px}.container{max-width:1400px;margin:0 auto;background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap}h1{color:#2c3e50;margin-bottom:10px}.subtitle{color:#7f8c8d;margin-bottom:30px}.db-info{background:#e8f4f8;padding:12px 20px;border-radius:8px;font-size:13px;color:#2c3e50}.change-db{background:#6c757d;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:13px;text-decoration:none;display:inline-block;margin-top:10px}.tabs{display:flex;gap:10px;margin-bottom:20px;border-bottom:2px solid #ecf0f1;flex-wrap:wrap}.tab{padding:12px 24px;cursor:pointer;background:none;border:none;font-size:16px;color:#7f8c8d;transition:all 0.3s}.tab.active{color:#3498db;border-bottom:3px solid #3498db;margin-bottom:-2px}.tab:hover{color:#3498db}.tab-content{display:none;padding:20px 0}.tab-content.active{display:block}.form-group{margin-bottom:20px}label{display:block;margin-bottom:5px;color:#2c3e50;font-weight:600}input,select,textarea{width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;font-size:14px}input:focus,select:focus{outline:none;border-color:#3498db}.form-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px}button{background:#3498db;color:white;padding:12px 24px;border:none;border-radius:5px;cursor:pointer;font-size:16px;transition:background 0.3s}button:hover{background:#2980b9}button.danger{background:#e74c3c}button.danger:hover{background:#c0392b}button.success{background:#27ae60}button.success:hover{background:#229954}button.warning{background:#f39c12}button.warning:hover{background:#e67e22}button.small{padding:6px 12px;font-size:13px}table{width:100%;border-collapse:collapse;margin-top:20px}th,td{padding:12px;text-align:left;border-bottom:1px solid #ecf0f1}th{background:#3498db;color:white;font-weight:600}tr:hover{background:#f8f9fa}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px;margin-bottom:30px}.metric-card{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;padding:20px;border-radius:10px;text-align:center}.metric-card h3{font-size:14px;margin-bottom:10px;opacity:0.9}.metric-card .value{font-size:28px;font-weight:bold}.chart-container{margin-top:30px;text-align:center}.chart-container img{max-width:100%;height:auto;border-radius:10px}.filter-section{background:#f8f9fa;padding:20px;border-radius:8px;margin-bottom:20px}.filter-section h3{margin-bottom:15px;color:#2c3e50}.action-buttons{display:flex;gap:10px}.modal{display:none;position:fixed;z-index:1000;left:0;top:0;width:100%;height:100%;background-color:rgba(0,0,0,0.5)}.modal-content{background-color:white;margin:5% auto;padding:30px;border-radius:10px;width:90%;max-width:600px}.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}.close{color:#aaa;font-size:28px;font-weight:bold;cursor:pointer}.close:hover{color:#000}</style>
+</head><body><div class="container"><div class="header"><div><h1>💰 Purushoth Finance</h1><p class="subtitle">Track expenses & income</p></div><div><div class="db-info">📁 {{ db_name }}</div><a href="/change-database" class="change-db">Change DB</a></div></div>
+<div class="tabs"><button class="tab active" onclick="showTab('add')">Add Transaction</button><button class="tab" onclick="showTab('upload')">Upload Excel</button><button class="tab" onclick="showTab('analytics')">Analytics</button><button class="tab" onclick="showTab('transactions')">Transactions</button><button class="tab" onclick="showTab('categories')">Categories</button><button class="tab" onclick="showTab('accounts')">Accounts</button></div>
+<div id="add" class="tab-content active"><h2>Add New Transaction</h2><form action="/add_transaction" method="POST" id="addForm"><div class="form-row"><div class="form-group"><label>Date</label><input type="date" name="t_date" id="t_date" value="{{today}}" required></div><div class="form-group"><label>Type</label><select name="t_type"><option value="expense">Expense</option><option value="income">Income</option></select></div><div class="form-group"><label>Amount (€)</label><input type="number" name="amount" step="0.01" min="0.01" required></div></div><div class="form-group"><label>Description</label><input type="text" name="description" required></div><div class="form-row"><div class="form-group"><label>Category</label><select name="category" id="category" required>{%for cat in categories%}<option value="{{cat}}">{{cat}}</option>{%endfor%}<option value="Uncategorized">Uncategorized</option></select></div><div class="form-group"><label>Source</label><input type="text" name="source" value="manual"></div><div class="form-group"><label>Account</label><select name="account" id="account" required><option value="Main" selected>Main</option>{%for acc in accounts%}{%if acc != 'Main'%}<option value="{{acc}}">{{acc}}</option>{%endif%}{%endfor%}</select></div></div><button type="submit" class="success">Add Transaction</button></form></div>
+<div id="upload" class="tab-content"><h2>📊 Upload Excel</h2><form action="/upload_excel" method="POST" enctype="multipart/form-data"><div class="form-group"><label>Select File (.xlsx, .xls, .csv)</label><input type="file" name="file" accept=".xlsx,.xls,.csv" required style="padding:20px;border:2px dashed #3498db"></div><div style="background:#e8f4f8;padding:20px;border-radius:8px;margin:20px 0"><h3>📋 Column Mapping</h3><div class="form-row"><div class="form-group"><label>Date</label><input type="text" name="col_date" value="t_date"></div><div class="form-group"><label>Description</label><input type="text" name="col_description" value="description"></div><div class="form-group"><label>Amount</label><input type="text" name="col_amount" value="amount"></div></div><div class="form-row"><div class="form-group"><label>Type</label><input type="text" name="col_type" value="t_type"></div><div class="form-group"><label>Category</label><input type="text" name="col_category" value="category"></div><div class="form-group"><label>Source</label><input type="text" name="col_source" value="source"></div><div class="form-group"><label>Account</label><input type="text" name="col_account" value="account"></div></div></div><button type="submit" class="success">📤 Upload</button></form></div>
+<div id="analytics" class="tab-content"><h2>Analytics</h2><div class="filter-section"><h3>📅 Filter</h3><form action="/" method="GET"><input type="hidden" name="tab" value="analytics"><div class="form-row"><div class="form-group"><label>Start Date</label><input type="date" name="start_date" value="{{start_date}}"></div><div class="form-group"><label>End Date</label><input type="date" name="end_date" value="{{end_date}}"></div><div class="form-group"><label>Category</label><select name="filter_category"><option value="All">All</option>{%for cat in categories%}<option value="{{cat}}" {%if filter_category==cat%}selected{%endif%}>{{cat}}</option>{%endfor%}</select></div><div class="form-group"><label>Account</label><select name="filter_account"><option value="All">All Accounts</option>{%for acc in accounts%}<option value="{{acc}}" {%if filter_account==acc%}selected{%endif%}>{{acc}}</option>{%endfor%}</select></div><div class="form-group" style="display:flex;align-items:flex-end"><button type="submit" class="success">Apply</button></div></div></form></div><div class="metrics"><div class="metric-card"><h3>Total Expenses</h3><div class="value">€{{"%.2f"|format(total_expenses)}}</div></div><div class="metric-card"><h3>Total Income</h3><div class="value">€{{"%.2f"|format(total_income)}}</div></div><div class="metric-card"><h3>Balance</h3><div class="value">€{{"%.2f"|format(balance)}}</div></div></div>{%if chart%}<div class="chart-container"><h3>Expenses by Category</h3><img src="data:image/png;base64,{{chart}}"></div>{%endif%}</div>
+<div id="transactions" class="tab-content"><h2>Transactions</h2><div class="filter-section"><h3>📅 Filter & Search</h3><form action="/" method="GET"><input type="hidden" name="tab" value="transactions"><div class="form-row"><div class="form-group"><label>Start Date</label><input type="date" name="start_date" value="{{start_date}}"></div><div class="form-group"><label>End Date</label><input type="date" name="end_date" value="{{end_date}}"></div><div class="form-group"><label>Category</label><select name="filter_category"><option value="All">All</option>{%for cat in categories%}<option value="{{cat}}" {%if filter_category==cat%}selected{%endif%}>{{cat}}</option>{%endfor%}</select></div><div class="form-group"><label>Account</label><select name="filter_account"><option value="All">All Accounts</option>{%for acc in accounts%}<option value="{{acc}}" {%if filter_account==acc%}selected{%endif%}>{{acc}}</option>{%endfor%}</select></div><div class="form-group"><label>🔍 Search Keyword</label><input type="text" name="search" value="{{search_keyword}}" placeholder="Search in description..."></div><div class="form-group" style="display:flex;align-items:flex-end"><button type="submit" class="success">Apply</button></div></div></form></div>{%if transactions|length>0%}<table><thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Type</th><th>Category</th><th>Account</th><th>Actions</th></tr></thead><tbody>{%for t in transactions%}<tr><td>{{t.t_date}}</td><td>{{t.description}}</td><td>€{{"%.2f"|format(t.amount)}}</td><td>{{t.t_type}}</td><td>{{t.category}}</td><td>{{t.account}}</td><td><div class="action-buttons"><button class="warning small" onclick="editTransaction({{t.id}})">Edit</button><form action="/delete_transaction/{{t.id}}" method="POST" style="display:inline"><button type="submit" class="danger small" onclick="return confirm('Delete?')">Delete</button></form></div></td></tr>{%endfor%}</tbody></table>{%else%}<p>No transactions</p>{%endif%}</div>
+<div id="categories" class="tab-content"><h2>Categories</h2><form action="/add_category" method="POST"><div class="form-group"><label>New Category</label><input type="text" name="name" required></div><button type="submit" class="success">Add</button></form><h3 style="margin-top:30px">Existing Categories</h3><div style="margin-bottom:15px"><input type="text" id="catSearch" placeholder="🔍 Search categories..." style="max-width:400px" onkeyup="searchCategories()"></div>{%if categories|length>0%}<table id="catTable"><thead><tr><th>Name</th><th>Actions</th></tr></thead><tbody>{%for cat in categories%}<tr><td>{{cat}}</td><td><div class="action-buttons"><button class="warning small" onclick="editCategory('{{cat}}')">Edit</button><form action="/delete_category/{{cat}}" method="POST" style="display:inline"><button type="submit" class="danger small" onclick="return confirm('Delete?')">Delete</button></form></div></td></tr>{%endfor%}</tbody></table>{%else%}<p>No categories</p>{%endif%}</div>
+<div id="accounts" class="tab-content"><h2>Accounts</h2><form action="/add_account" method="POST"><div class="form-group"><label>New Account</label><input type="text" name="name" required></div><button type="submit" class="success">Add</button></form><h3 style="margin-top:30px">Balances</h3>{%if account_balances|length>0%}<table><thead><tr><th>Account</th><th>Income</th><th>Expenses</th><th>Balance</th></tr></thead><tbody>{%for acc in account_balances%}<tr><td>{{acc.account}}</td><td>€{{"%.2f"|format(acc.income)}}</td><td>€{{"%.2f"|format(acc.expense)}}</td><td><strong>€{{"%.2f"|format(acc.balance)}}</strong></td></tr>{%endfor%}</tbody></table>{%endif%}</div></div>
+<div id="editModal" class="modal"><div class="modal-content"><div class="modal-header"><h2>Edit Transaction</h2><span class="close" onclick="closeModal()">&times;</span></div><form id="editForm" method="POST"><div class="form-row"><div class="form-group"><label>Date</label><input type="date" name="t_date" id="e_date" required></div><div class="form-group"><label>Type</label><select name="t_type" id="e_type"><option value="expense">Expense</option><option value="income">Income</option></select></div><div class="form-group"><label>Amount</label><input type="number" name="amount" id="e_amount" step="0.01" required></div></div><div class="form-group"><label>Description</label><input type="text" name="description" id="e_desc" required></div><div class="form-row"><div class="form-group"><label>Category</label><select name="category" id="e_cat">{%for cat in categories%}<option value="{{cat}}">{{cat}}</option>{%endfor%}</select></div><div class="form-group"><label>Source</label><input type="text" name="source" id="e_source"></div><div class="form-group"><label>Account</label><select name="account" id="e_account">{%for acc in accounts%}<option value="{{acc}}">{{acc}}</option>{%endfor%}</select></div></div><div style="display:flex;gap:10px;margin-top:20px"><button type="submit" class="success">Save</button><button type="button" class="danger" onclick="closeModal()">Cancel</button></div></form></div></div>
+<script>function showTab(n){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));event.target.classList.add('active');document.getElementById(n).classList.add('active')}
+document.getElementById('addForm').addEventListener('submit',function(){localStorage.setItem('last_date',document.getElementById('t_date').value);localStorage.setItem('last_category',document.getElementById('category').value)});
+window.addEventListener('load',function(){const d=localStorage.getItem('last_date');const c=localStorage.getItem('last_category');if(d)document.getElementById('t_date').value=d;if(c)document.getElementById('category').value=c;const p=new URLSearchParams(window.location.search);const t=p.get('tab');if(t){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));document.querySelector(`button[onclick="showTab('${t}')"]`).classList.add('active');document.getElementById(t).classList.add('active')}});
+function editTransaction(id){fetch('/get_transaction/'+id).then(r=>r.json()).then(d=>{document.getElementById('e_date').value=d.t_date;document.getElementById('e_type').value=d.t_type;document.getElementById('e_amount').value=d.amount;document.getElementById('e_desc').value=d.description;document.getElementById('e_cat').value=d.category;document.getElementById('e_source').value=d.source;document.getElementById('e_account').value=d.account;document.getElementById('editForm').action='/edit_transaction/'+id;document.getElementById('editModal').style.display='block'})}
+function closeModal(){document.getElementById('editModal').style.display='none'}
+function editCategory(old){const n=prompt('New name:',old);if(n&&n!==old){fetch('/edit_category',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_name:old,new_name:n})}).then(r=>r.json()).then(d=>{if(d.success)location.reload();else alert('Error: '+d.message)})}}
+function searchCategories(){const input=document.getElementById('catSearch');const filter=input.value.toUpperCase();const table=document.getElementById('catTable');const tr=table.getElementsByTagName('tr');for(let i=1;i<tr.length;i++){const td=tr[i].getElementsByTagName('td')[0];if(td){const txtValue=td.textContent||td.innerText;if(txtValue.toUpperCase().indexOf(filter)>-1){tr[i].style.display=''}else{tr[i].style.display='none'}}}}
+window.onclick=function(e){const m=document.getElementById('editModal');if(e.target==m)m.style.display='none'}</script></body></html>"""
+
+@app.route('/setup', methods=['GET', 'POST'])
+def setup():
+    if request.method == 'POST':
+        db_path = request.form['db_path'].strip()
+        db_path = os.path.expanduser(db_path)
+        if not db_path.lower().endswith('.db'):
+            db_path += '.db'
+        db_dir = os.path.dirname(db_path)
+        if not db_dir:
+            db_path = os.path.join(os.getcwd(), db_path)
+        try:
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
+            conn = get_conn(db_path)
+            init_db(conn)
+            conn.close()
+            save_config(db_path)
+        except Exception as e:
+            return f"<html><body style='padding:50px;text-align:center'><h1>Error</h1><p>{e}</p><a href='/setup'>Try Again</a></body></html>", 400
+        return redirect(url_for('index'))
+    return render_template_string(SETUP_TEMPLATE)
+
+@app.route('/change-database')
+def change_database():
+    return redirect(url_for('setup'))
+
+@app.route('/')
+def index():
+    try:
+        config = load_config()
+        db_path = config.get('db_path')
+        if not db_path or not os.path.exists(os.path.expanduser(db_path)):
+            return redirect(url_for('setup'))
+        db_path = os.path.expanduser(db_path)
+        start_date = request.args.get('start_date', '')
+        end_date = request.args.get('end_date', '')
+        filter_category = request.args.get('filter_category', 'All')
+        filter_account = request.args.get('filter_account', 'All')
+        search_keyword = request.args.get('search', '')
+        conn = get_conn(db_path)
+        categories = list_categories(conn)
+        accounts = list_accounts(conn)
+        df = fetch_transactions_df(conn, start_date=start_date if start_date else None, end_date=end_date if end_date else None, category=filter_category if filter_category != 'All' else None, account=filter_account if filter_account != 'All' else None, search=search_keyword if search_keyword else None)
+        total_expenses = df[df['t_type'] == 'expense']['amount'].sum() if not df.empty else 0
+        total_income = df[df['t_type'] == 'income']['amount'].sum() if not df.empty else 0
+        balance = total_income - total_expenses
+        chart = None
+        exp = df[df["t_type"] == "expense"]
+        if not exp.empty:
+            by_cat = exp.groupby("category")["amount"].sum().sort_values(ascending=False)
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.pie(by_cat.values, labels=by_cat.index, autopct='%1.1f%%', startangle=90)
+            ax.axis('equal')
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight')
+            buf.seek(0)
+            chart = base64.b64encode(buf.read()).decode('utf-8')
+            plt.close()
+        acc_balances = account_balances(conn, start_date=start_date if start_date else None, end_date=end_date if end_date else None).to_dict('records')
+        conn.close()
+        return render_template_string(HTML_TEMPLATE, today=date.today().isoformat(), categories=categories, accounts=accounts, transactions=df.to_dict('records'), total_expenses=total_expenses, total_income=total_income, balance=balance, chart=chart, account_balances=acc_balances, db_name=os.path.basename(db_path), start_date=start_date, end_date=end_date, filter_category=filter_category, filter_account=filter_account, search_keyword=search_keyword)
+    except Exception as e:
+        print(f"Error: {e}")
+        return redirect(url_for('setup'))
+
+@app.route('/add_transaction', methods=['POST'])
+def add_transaction():
+    config = load_config()
+    conn = get_conn(config['db_path'])
+    insert_transaction(conn, request.form['t_date'], request.form['description'], float(request.form['amount']), request.form['t_type'], request.form['category'], request.form['source'], request.form['account'])
+    conn.close()
+    return redirect(url_for('index'))
+
+@app.route('/get_transaction/<int:id>')
+def get_transaction(id):
+    config = load_config()
+    conn = get_conn(config['db_path'])
+    transaction = get_transaction_by_id(conn, id)
+    conn.close()
+    return jsonify(transaction)
+
+@app.route('/edit_transaction/<int:id>', methods=['POST'])
+def edit_transaction(id):
+    config = load_config()
+    conn = get_conn(config['db_path'])
+    update_transaction(conn, id, request.form['t_date'], request.form['description'], float(request.form['amount']), request.form['t_type'], request.form['category'], request.form['source'], request.form['account'])
+    conn.close()
+    return redirect(url_for('index') + '?tab=transactions')
+
+@app.route('/delete_transaction/<int:id>', methods=['POST'])
+def delete_transaction(id):
+    config = load_config()
+    conn = get_conn(config['db_path'])
+    delete_transactions(conn, [id])
+    conn.close()
+    return redirect(url_for('index') + '?tab=transactions')
+
+@app.route('/add_category', methods=['POST'])
+def add_category_route():
+    config = load_config()
+    conn = get_conn(config['db_path'])
+    add_category(conn, request.form['name'])
+    conn.close()
+    return redirect(url_for('index') + '?tab=categories')
+
+@app.route('/edit_category', methods=['POST'])
+def edit_category_route():
+    try:
+        data = request.json
+        config = load_config()
+        conn = get_conn(config['db_path'])
+        update_category(conn, data['old_name'], data['new_name'])
+        conn.close()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/delete_category/<name>', methods=['POST'])
+def delete_category_route(name):
+    config = load_config()
+    conn = get_conn(config['db_path'])
+    delete_categories(conn, [name])
+    conn.close()
+    return redirect(url_for('index') + '?tab=categories')
+
+@app.route('/add_account', methods=['POST'])
+def add_account_route():
+    config = load_config()
+    conn = get_conn(config['db_path'])
+    add_account(conn, request.form['name'])
+    conn.close()
+    return redirect(url_for('index') + '?tab=accounts')
+
+@app.route('/upload_excel', methods=['POST'])
+def upload_excel():
+    try:
+        config = load_config()
+        conn = get_conn(config['db_path'])
+        if 'file' not in request.files:
+            return "No file", 400
+        file = request.files['file']
+        if file.filename == '':
+            return "No file selected", 400
+        col_date = request.form.get('col_date', 't_date').strip()
+        col_description = request.form.get('col_description', 'description').strip()
+        col_amount = request.form.get('col_amount', 'amount').strip()
+        col_type = request.form.get('col_type', 't_type').strip()
+        col_category = request.form.get('col_category', 'category').strip()
+        col_source = request.form.get('col_source', 'source').strip()
+        col_account = request.form.get('col_account', 'account').strip()
+        filename = file.filename.lower()
+        if filename.endswith('.csv'):
+            df = pd.read_csv(file)
+        elif filename.endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(file)
+        else:
+            return "Unsupported format", 400
+        if col_date not in df.columns or col_amount not in df.columns:
+            return f"Missing columns. Available: {', '.join(df.columns)}", 400
+        imported_count = 0
+        errors = []
+        for idx, row in df.iterrows():
+            try:
+                date_val = str(row[col_date])
+                try:
+                    if '/' in date_val:
+                        parsed_date = pd.to_datetime(date_val, format='%d/%m/%Y')
+                    else:
+                        parsed_date = pd.to_datetime(date_val)
+                    date_str = parsed_date.strftime('%Y-%m-%d')
+                except:
+                    errors.append(f"Row {idx+1}: Invalid date")
+                    continue
+                try:
+                    amount_val = float(row[col_amount])
+                    if amount_val <= 0:
+                        errors.append(f"Row {idx+1}: Amount must be positive")
+                        continue
+                except:
+                    errors.append(f"Row {idx+1}: Invalid amount")
+                    continue
+                description = str(row.get(col_description, 'Imported')).strip()
+                if not description or description == 'nan':
+                    description = 'Imported'
+                t_type = str(row.get(col_type, 'expense')).strip().lower()
+                if t_type not in ['expense', 'income']:
+                    t_type = 'expense'
+                category = str(row.get(col_category, 'Uncategorized')).strip()
+                if not category or category == 'nan':
+                    category = 'Uncategorized'
+                source = str(row.get(col_source, 'excel_import')).strip()
+                if not source or source == 'nan':
+                    source = 'excel_import'
+                account = str(row.get(col_account, 'Main')).strip()
+                if not account or account == 'nan':
+                    account = 'Main'
+                insert_transaction(conn, date_str, description, amount_val, t_type, category, source, account)
+                imported_count += 1
+            except Exception as e:
+                errors.append(f"Row {idx+1}: {str(e)}")
+        conn.close()
+        msg = f"<html><body style='padding:50px;font-family:Arial'><h1 style='color:#27ae60'>✅ Imported {imported_count} transactions</h1>"
+        if errors:
+            msg += f"<div style='background:#fff3cd;padding:20px;margin:20px 0;border-radius:8px'><strong>Errors ({len(errors)}):</strong><ul>{''.join(f'<li>{e}</li>' for e in errors[:20])}</ul></div>"
+        msg += "<a href='/' style='background:#3498db;color:white;padding:15px 30px;text-decoration:none;border-radius:5px;display:inline-block'>Back</a></body></html>"
+        return msg
+    except Exception as e:
+        return f"<html><body style='padding:50px;text-align:center'><h1>Error</h1><p>{str(e)}</p><a href='/'>Back</a></body></html>", 400
+
+def open_browser():
+    webbrowser.open('http://127.0.0.1:5000')
+
+if __name__ == '__main__':
+    print("=" * 50)
+    print("🚀 Purushoth Finance App")
+    print("📊 http://127.0.0.1:5000")
+    print("🛑 Press CTRL+C to stop")
+    print("=" * 50)
+    threading.Timer(1.5, open_browser).start()
+    app.run(debug=True, host='127.0.0.1', port=5000)
