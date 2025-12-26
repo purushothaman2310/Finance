@@ -71,7 +71,7 @@ pip install -r requirements.txt
 
 3. **Run the application**
 ```bash
-python FinanceappbyClaude.py
+python PurushothFinance.py
 ```
 
 4. **Open your browser**
@@ -102,7 +102,7 @@ pip install -r requirements.txt
 
 ### First Time Setup
 
-1. **Launch the app** - Run `python FinanceappbyClaude.py`
+1. **Launch the app** - Run `python PurushothFinance.py`
 2. **Database Setup** - Enter your database location:
    - Simple: `my_finance.db` (saves in app folder)
    - Full path: `C:/Users/YourName/Documents/finance.db`
@@ -131,7 +131,7 @@ pip install -r requirements.txt
 ### Managing Accounts
 
 1. Go to **"Accounts"** tab
-2. **Add Account** - Enter account name (e.g., "ING Giro", "Savings")
+2. **Add Account** - Enter account name (e.g., "Master ", "Visa")
 3. **View Balances** - See income, expenses, and balance for each account
 
 ### Importing from Excel
@@ -172,7 +172,7 @@ pip install -r requirements.txt
 ```
 finance-app/
 │
-├── FinanceappbyClaude.py      # Main application file
+├── PurushothFinance.py      # Main application file
 ├── requirements.txt            # Python dependencies
 ├── README.md                   # This file
 ├── finance_config.json         # Auto-generated config (created on first run)
@@ -412,9 +412,9 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 📧 Contact
 
-**Your Name** - [@YourTwitter](https://twitter.com/yourhandle) - your.email@example.com
+**Your Name** - [purushothaman7074@gmail.com]
 
-**Project Link:** [https://github.com/YourUsername/finance-app](https://github.com/YourUsername/finance-app)
+**Project Link:** [https://github.com/purushothaman2310/Finance](https://github.com/YourUsername/finance-app)
 
 ---
 
