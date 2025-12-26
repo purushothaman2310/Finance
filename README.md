@@ -60,7 +60,7 @@ Manage multiple bank accounts and track balances separately.
 
 1. **Clone the repository**
 ```bash
-git clone [(https://github.com/purushothaman2310/Finance.git)]
+git clone https://github.com/purushothaman2310/Finance.git
 cd finance-app
 ```
 
